@@ -67,6 +67,7 @@ Conversion goes both ways and is tested as a round trip: rich_text → Markdown 
 
 - Design, before implementation: GPT-6.1 Sol (high). Adopted: revision handles, escaping with a lossless check, extraction inside the CLI, no `--force`, IDs and URLs instead of name lookups, draft text as data in the skill. Declined: switching away before every write (above).
 - Code, commit 8537cda: Opus 5.5 (high), fresh context, MVP bar. Fixed: one-line and unclosed fences, `_canonical` hiding borders and unknown styles, URLs with parentheses, the re-read/write window (the compare-and-swap above), the persistent login profile, mention labels that could break mentions, styled-whitespace and emoji `unicode` false read-only, backslashes in ordinary text, `>` at a line start, and a write with no draft in the response reported as success.
+- Fixes, commit db8178a: Opus 5.5 (high), fresh context, with a ~150K-case random round-trip check. Fixed: an unknown style or key could still vanish by merging into a neighboring run (the check now merges only identical runs), and split bold runs were falsely read-only. Left as limits: a one-line fence after other text on the same line parses as inline code; `auth login`'s temporary profile (mode 0700) survives a hard kill of the process; drafts whose text ends in a newline are read-only. Two review rounds done.
 
 ## Not in scope (MVP)
 

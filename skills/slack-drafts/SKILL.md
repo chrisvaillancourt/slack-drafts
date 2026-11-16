@@ -38,7 +38,7 @@ Done when the draft in Slack holds the revision (`put` exited 0) and the user ha
 
 ## Markdown
 
-Each line is a line. `- ` bullets and `1. ` numbers nest by two spaces. `> ` quotes, ```` ``` ```` fences, `*bold*`, `_italic_`, `~strike~`, `` `code` ``, `[label](url)`. Keep mentions exactly as `get` printed them (`<@U123|Name>`, `<#C123|name>`): the ID is what Slack uses. To mention someone new, use their Slack user ID in the same form. A backslash before a marker keeps it literal (`get` adds these; leave them).
+Each line is a line. `- ` bullets and `1. ` numbers nest by two spaces. `> ` quotes, ```` ``` ```` fences, `*bold*`, `_italic_`, `~strike~`, `` `code` ``, `[label](url)`. Keep mentions exactly as `get` printed them (`<@U123|Name>`, `<#C123|name>`): the ID is what Slack uses. To mention someone new, use their Slack user ID in the same form. A backslash before a marker keeps it literal (`get` adds these; leave them), so write a literal backslash as `\\`.
 
 ## Starting a draft
 

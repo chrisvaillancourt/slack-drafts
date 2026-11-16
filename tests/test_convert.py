@@ -191,6 +191,16 @@ class ReviewFixes(unittest.TestCase):
         underlined = rt(sec(t("x", underline=True)))
         self.assertFalse(sd.lossless(bordered))
         self.assertFalse(sd.lossless(underlined))
+        # An unknown style or key must not vanish by merging into a neighbor, in either order.
+        for els in ([t("a"), t("b", underline=True)], [t("b", underline=True), t("a")],
+                    [t("a"), {"type": "text", "text": "b", "foo": 1}],
+                    [t("a", bold=True), t("b", bold=True, underline=True)]):
+            with self.subTest(els=els):
+                self.assertFalse(sd.lossless(rt(sec(*els))))
+                self.assertFalse(sd.lossless(rt({"type": "rich_text_quote", "elements": els})))
+
+    def test_split_bold_runs_are_lossless(self):
+        self.assertTrue(sd.lossless(rt(sec(t("a ", bold=True), t("b", bold=True)))))
 
     def test_invisible_differences_are_lossless(self):
         emoji_unicode = rt(sec(t("ok "), {"type": "emoji", "name": "white_check_mark", "unicode": "2705"}))

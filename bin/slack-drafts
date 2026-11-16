@@ -464,6 +464,19 @@ def _hug(e: dict) -> list:
     return ([{**plain, "text": lead}] if lead else []) + [{**e, "text": core}] + ([{**plain, "text": trail}] if trail else [])
 
 
+def _merge_exact(elements: list) -> list:
+    """Merge adjacent text runs only when every key but the text matches, so no style or key
+    can vanish into a neighbor (unlike _merge_texts, which compares known styles only)."""
+    out: list = []
+    rest = lambda e: {k: v for k, v in e.items() if k != "text"}
+    for el in elements:
+        if out and el.get("type") == "text" and out[-1].get("type") == "text" and rest(el) == rest(out[-1]):
+            out[-1] = {**out[-1], "text": out[-1].get("text", "") + el.get("text", "")}
+        else:
+            out.append(el)
+    return out
+
+
 def _canonical(blocks: list) -> list:
     """Blocks reduced to what shows, for the lossless check. Unknown keys and styles are kept,
     so anything the converter doesn't model makes the comparison fail."""
@@ -483,8 +496,10 @@ def _canonical(blocks: list) -> list:
                 if not v:
                     continue
             if k == "elements":
-                v = [h for e in v for h in _hug(clean(e))]
-                v = _merge_texts(v) if el.get("type") in ("rich_text_section", "rich_text_quote") else v
+                v = [clean(e) for e in v]
+                if el.get("type") in ("rich_text_section", "rich_text_quote"):
+                    # Merge, hug, merge: split runs like "*a *" + "*b*" compare equal to "*a b*".
+                    v = _merge_exact([h for e in _merge_exact(v) for h in _hug(e)])
                 v = [e for e in v if not (e.get("type") == "text" and e.get("text") == "")]
             out[k] = v if k == "elements" else clean(v)
         return out
