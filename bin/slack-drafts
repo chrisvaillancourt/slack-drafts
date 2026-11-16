@@ -1,0 +1,1015 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""slack-drafts: read and revise your unsent Slack drafts. It never sends.
+
+Usage:
+  slack-drafts list [--json]              unsent drafts, newest first
+  slack-drafts get [REF] [--json]         a draft as Markdown (default: the newest)
+  slack-drafts put --rev REV [--from FILE]  replace that draft's text (stdin by default)
+  slack-drafts new DEST [--from FILE]     start a draft in a conversation that has none
+  slack-drafts diff [REF]                 the agent's last write against the draft now
+  slack-drafts auth login [--port N]      log in through a dedicated Chrome, store credentials
+  slack-drafts auth status                who the stored credentials belong to
+
+REF is a draft ID (Dr...), a list number (1, 2, ...), a channel ID (C..., D...,
+G...), CHANNEL:THREAD_TS, or a Slack message or channel URL. DEST takes the
+same forms except a draft ID or list number.
+
+`get` prints the draft to stdout and a header to stderr ending in `rev=...`.
+`put --rev` writes only if the draft is still at that revision: any edit
+since (yours in Slack, or another agent's) makes it refuse with exit 5. After a
+write, switch to another conversation in Slack and back before you edit: an
+open message box doesn't refresh, and typing into it saves the old text over
+the new.
+
+Markdown: each line is a line. "- " bullets and "1. " numbers nest by two
+spaces. "> " quotes, ``` fences, *bold* or **bold**, _italic_, ~strike~,
+`code`, [label](url). Mentions are <@U123|Name> and <#C123|name> (the part
+after | is only a label), <!here>, :emoji:. A backslash makes a marker literal.
+
+Exit codes: 0 ok, 1 Slack API error, 2 bad usage or no match, 3 not logged in,
+5 the draft changed since your read (conflict), 6 refused (scheduled draft, or
+content this tool can't write back without loss).
+
+Environment: SLACK_DRAFTS_TOKEN and SLACK_DRAFTS_COOKIE (instead of the
+keychain), SLACK_DRAFTS_WORKSPACE (e.g. acme.slack.com), SLACK_DRAFTS_API (API
+base URL; the tests use it), SLACK_DRAFTS_STATE_DIR (history; default
+$XDG_STATE_HOME/slack-drafts), SLACK_DRAFTS_CONFIG_DIR (default
+$XDG_CONFIG_HOME/slack-drafts).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import decimal
+import difflib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+EXIT_API, EXIT_USAGE, EXIT_AUTH, EXIT_CONFLICT, EXIT_REFUSED = 1, 2, 3, 5, 6
+
+# The only Slack methods this tool may call. Nothing here can send a message.
+ALLOWED_METHODS = frozenset(
+    {"auth.test", "drafts.list", "drafts.create", "drafts.update", "conversations.info", "users.info"}
+)
+
+KEYCHAIN_TOKEN = "slack-drafts.token"
+KEYCHAIN_COOKIE = "slack-drafts.cookie"
+
+
+class Fail(Exception):
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+# --------------------------------------------------------------------------
+# Converter: Slack rich_text <-> Markdown
+# --------------------------------------------------------------------------
+
+STYLE_MARKS = (("code", "`"), ("strike", "~"), ("italic", "_"), ("bold", "*"))  # inner to outer
+MARK_STYLE = {"*": "bold", "_": "italic", "~": "strike"}
+LINE_START = re.compile(r"^( *)([-*•>]|```|\d+[.)])(?= |$|`)")
+LIST_ITEM = re.compile(r"^( *)([-*•]|(\d+)[.)]) (.*)$")
+QUOTE = re.compile(r"^> ?(.*)$")
+EMOJI = re.compile(r":([a-z0-9_+'-]+):(?::skin-tone-([2-6]):)?")
+USER = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>\n]*)?>")
+CHANNEL = re.compile(r"<#([CGD][A-Z0-9]+)(?:\|[^>\n]*)?>")
+BROADCAST = re.compile(r"<!(here|channel|everyone)>")
+USERGROUP = re.compile(r"<!subteam\^([A-Z0-9]+)(?:\|[^>\n]*)?>")
+ANGLE_LINK = re.compile(r"<((?:https?|mailto):[^|>\s]+)(?:\|([^>\n]*))?>")
+MD_LINK = re.compile(r"\[([^\]\n]+)\]\(((?:https?|mailto):[^)\s]+)\)")
+BARE_URL = re.compile(r"https?://[^\s<>]+")
+PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~•")
+
+
+def _is_boundary(ch: str | None) -> bool:
+    return ch is None or ch.isspace() or (ch in PUNCT and ch not in "*_~")
+
+
+def _style_of(el: dict) -> dict:
+    return {k: True for k, v in (el.get("style") or {}).items() if v and k in ("bold", "italic", "strike", "code")}
+
+
+def _escape_text(s: str) -> str:
+    """Backslash anything in plain text that would parse as markup."""
+    out = []
+    n = len(s)
+    for i, ch in enumerate(s):
+        prev = s[i - 1] if i > 0 else None
+        nxt = s[i + 1] if i + 1 < n else None
+        esc = False
+        if ch in "\\`":
+            esc = True
+        elif ch in "*_~":
+            opener = _is_boundary(prev) and nxt is not None and not nxt.isspace()
+            closer = prev is not None and not prev.isspace() and _is_boundary(nxt)
+            esc = opener or closer
+        elif ch == "[":
+            esc = bool(MD_LINK.match(s, i))
+        elif ch == "<":
+            esc = nxt in ("@", "#", "!") or s.startswith(("<http", "<mailto"), i)
+        elif ch == ":":
+            esc = (prev is None or not prev.isalnum()) and bool(EMOJI.match(s, i))
+        elif ch == "h":
+            esc = (prev is None or not prev.isalnum()) and bool(BARE_URL.match(s, i))
+            if esc:
+                out.append("\\")  # escapes the URL by its first char; parse drops the backslash
+                out.append(ch)
+                continue
+        if esc:
+            out.append("\\")
+        out.append(ch)
+    return "".join(out)
+
+
+def _wrap(core: str, style: dict) -> str:
+    if not core:
+        return core
+    lead = core[: len(core) - len(core.lstrip())]
+    trail = core[len(core.rstrip()):]
+    mid = core.strip()
+    if not mid:
+        return core
+    for key, mark in STYLE_MARKS:
+        if style.get(key):
+            mid = f"{mark}{mid}{mark}"
+    return f"{lead}{mid}{trail}"
+
+
+def _merge_texts(elements: list) -> list:
+    out: list = []
+    for el in elements:
+        if out and el.get("type") == "text" and out[-1].get("type") == "text" and _style_of(el) == _style_of(out[-1]):
+            out[-1] = {**out[-1], "text": out[-1]["text"] + el.get("text", "")}
+        else:
+            out.append(dict(el))
+    return out
+
+
+def _inline_md(elements: list, names: dict, unsupported: list) -> str:
+    parts = []
+    for el in _merge_texts(elements):
+        kind = el.get("type")
+        style = _style_of(el)
+        if kind == "text":
+            text = el.get("text", "")
+            if style.get("code"):
+                # Styles hug the code span; whitespace stays outside.
+                lead = text[: len(text) - len(text.lstrip())]
+                trail = text[len(text.rstrip()):]
+                core = text.strip()
+                parts.append(lead + _wrap(f"`{core}`", {k: v for k, v in style.items() if k != "code"}) + trail if core else text)
+            else:
+                # Wrap first, then escape the inside so markers we add stay unescaped.
+                lead = text[: len(text) - len(text.lstrip())]
+                trail = text[len(text.rstrip()):]
+                core = text.strip()
+                if not core:
+                    parts.append(text)
+                else:
+                    parts.append(lead + _wrap(_escape_text(core), style) + trail)
+            continue
+        if kind == "link":
+            url = el.get("url", "")
+            label = el.get("text")
+            raw = f"[{label}]({url})" if label and label != url else url
+        elif kind == "user":
+            uid = el.get("user_id", "")
+            raw = f"<@{uid}|{names[uid]}>" if names.get(uid) else f"<@{uid}>"
+        elif kind == "channel":
+            cid = el.get("channel_id", "")
+            raw = f"<#{cid}|{names[cid]}>" if names.get(cid) else f"<#{cid}>"
+        elif kind == "usergroup":
+            raw = f"<!subteam^{el.get('usergroup_id', '')}>"
+        elif kind == "broadcast":
+            raw = f"<!{el.get('range', 'here')}>"
+        elif kind == "emoji":
+            raw = f":{el.get('name', '')}:"
+            if el.get("skin_tone"):
+                raw += f":skin-tone-{el['skin_tone']}:"
+        else:
+            unsupported.append(kind or "?")
+            raw = f"⟦unsupported {kind}⟧"
+        parts.append(_wrap(raw, style))
+    return "".join(parts)
+
+
+def _escape_line_starts(text: str) -> str:
+    lines = []
+    for line in text.split("\n"):
+        m = LINE_START.match(line)
+        if m:
+            spaces, marker = m.group(1), m.group(2)
+            if marker[0].isdigit():
+                line = spaces + marker[:-1] + "\\" + marker[-1] + line[len(spaces) + len(marker):]
+            else:
+                line = spaces + "\\" + line[len(spaces):]
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def blocks_to_md(blocks: list, names: dict) -> tuple[str, list]:
+    """Render a draft's blocks as Markdown. Returns (markdown, unsupported element types)."""
+    unsupported: list = []
+    chunks: list = []
+    for block in blocks or []:
+        if block.get("type") != "rich_text":
+            unsupported.append(block.get("type", "?"))
+            chunks.append(f"⟦unsupported {block.get('type')}⟧")
+            continue
+        for el in block.get("elements", []):
+            kind = el.get("type")
+            if kind == "rich_text_section":
+                chunks.append(_escape_line_starts(_inline_md(el.get("elements", []), names, unsupported)))
+            elif kind == "rich_text_list":
+                indent = "  " * int(el.get("indent") or 0)
+                ordered = el.get("style") == "ordered"
+                start = int(el.get("offset") or 0)
+                items = []
+                for i, item in enumerate(el.get("elements", [])):
+                    marker = f"{start + i + 1}." if ordered else "-"
+                    body = _inline_md(item.get("elements", []), names, unsupported).replace("\n", " ")
+                    items.append(f"{indent}{marker} {body}")
+                chunks.append("\n".join(items))
+            elif kind == "rich_text_quote":
+                body = _inline_md(el.get("elements", []), names, unsupported)
+                chunks.append("\n".join(f"> {line}" if line else ">" for line in body.split("\n")))
+            elif kind == "rich_text_preformatted":
+                body = "".join(e.get("text", e.get("url", "")) for e in el.get("elements", []))
+                chunks.append(f"```\n{body}\n```")
+            else:
+                unsupported.append(kind or "?")
+                chunks.append(f"⟦unsupported {kind}⟧")
+    return "\n".join(chunks), unsupported
+
+
+def _find_closer(s: str, start: int, mark: str) -> int:
+    j = start
+    n = len(s)
+    while True:
+        j = s.find(mark, j)
+        if j < 0:
+            return -1
+        if s[j - 1] == "\\":
+            j += 1
+            continue
+        prev = s[j - 1]
+        nxt = s[j + len(mark)] if j + len(mark) < n else None
+        if j > start and not prev.isspace() and _is_boundary(nxt) and not (mark == "*" and nxt == "*"):
+            return j
+        j += 1
+
+
+def _parse_inline(s: str, style: dict | None = None) -> list:
+    style = style or {}
+    out: list = []
+    buf: list = []
+
+    def flush():
+        if buf:
+            el = {"type": "text", "text": "".join(buf)}
+            if style:
+                el["style"] = dict(style)
+            out.append(el)
+            buf.clear()
+
+    def add(el):
+        flush()
+        if style:
+            el["style"] = dict(style)
+        out.append(el)
+
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        prev = s[i - 1] if i > 0 else None
+        if ch == "\\" and i + 1 < n and s[i + 1] in PUNCT | {"h"}:
+            buf.append(s[i + 1])
+            i += 2
+            continue
+        if ch == "`":
+            j = s.find("`", i + 1)
+            if j > i + 1:
+                flush()
+                out.append({"type": "text", "text": s[i + 1:j], "style": {**style, "code": True}})
+                i = j + 1
+                continue
+        if ch == "[":
+            m = MD_LINK.match(s, i)
+            if m:
+                add({"type": "link", "url": m.group(2), "text": m.group(1)})
+                i = m.end()
+                continue
+        if ch == "<":
+            for rx, make in (
+                (USER, lambda m: {"type": "user", "user_id": m.group(1)}),
+                (CHANNEL, lambda m: {"type": "channel", "channel_id": m.group(1)}),
+                (BROADCAST, lambda m: {"type": "broadcast", "range": m.group(1)}),
+                (USERGROUP, lambda m: {"type": "usergroup", "usergroup_id": m.group(1)}),
+                (ANGLE_LINK, lambda m: {"type": "link", "url": m.group(1), **({"text": m.group(2)} if m.group(2) else {})}),
+            ):
+                m = rx.match(s, i)
+                if m:
+                    add(make(m))
+                    i = m.end()
+                    break
+            else:
+                buf.append(ch)
+                i += 1
+            continue
+        if ch == "h" and (prev is None or not prev.isalnum()):
+            m = BARE_URL.match(s, i)
+            if m:
+                url = m.group(0)
+                while url and (url[-1] in ".,;:!?'\"" or (url[-1] == ")" and url.count("(") < url.count(")"))):
+                    url = url[:-1]
+                add({"type": "link", "url": url})
+                i += len(url)
+                continue
+        if ch == ":" and (prev is None or not prev.isalnum()):
+            m = EMOJI.match(s, i)
+            if m and (m.end() >= n or not s[m.end()].isalnum()):
+                el = {"type": "emoji", "name": m.group(1)}
+                if m.group(2):
+                    el["skin_tone"] = int(m.group(2))
+                add(el)
+                i = m.end()
+                continue
+        if ch in "*_~":
+            mark = "**" if s.startswith("**", i) else ch
+            nxt = s[i + len(mark)] if i + len(mark) < n else None
+            if _is_boundary(prev) and nxt is not None and not nxt.isspace():
+                j = _find_closer(s, i + len(mark), mark)
+                if j > 0:
+                    flush()
+                    out.extend(_parse_inline(s[i + len(mark):j], {**style, MARK_STYLE[ch]: True}))
+                    i = j + len(mark)
+                    continue
+        buf.append(ch)
+        i += 1
+    flush()
+    return _merge_texts(out)
+
+
+def md_to_blocks(md: str) -> list:
+    """Parse Markdown into one rich_text block, the shape Slack's composer saves."""
+    lines = md.rstrip("\n").split("\n")
+    elements: list = []
+    section: list = []
+
+    def flush_section():
+        if section:
+            text = "\n".join(section)
+            elements.append({"type": "rich_text_section", "elements": _parse_inline(text) if text else []})
+            section.clear()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip().startswith("```"):
+            flush_section()
+            body = []
+            i += 1
+            while i < len(lines) and lines[i].strip() != "```":
+                body.append(lines[i])
+                i += 1
+            i += 1
+            elements.append({"type": "rich_text_preformatted", "elements": [{"type": "text", "text": "\n".join(body)}]})
+            continue
+        m = LIST_ITEM.match(line)
+        if m:
+            flush_section()
+            current = None
+            while i < len(lines) and (m := LIST_ITEM.match(lines[i])):
+                indent = len(m.group(1)) // 2
+                style = "ordered" if m.group(3) else "bullet"
+                item = {"type": "rich_text_section", "elements": _parse_inline(m.group(4))}
+                if current and current["style"] == style and current["indent"] == indent:
+                    current["elements"].append(item)
+                else:
+                    current = {"type": "rich_text_list", "style": style, "indent": indent, "elements": [item]}
+                    if style == "ordered" and int(m.group(3)) > 1:
+                        current["offset"] = int(m.group(3)) - 1
+                    elements.append(current)
+                i += 1
+            continue
+        if QUOTE.match(line):
+            flush_section()
+            body = []
+            while i < len(lines) and (m := QUOTE.match(lines[i])):
+                body.append(m.group(1))
+                i += 1
+            elements.append({"type": "rich_text_quote", "elements": _parse_inline("\n".join(body))})
+            continue
+        section.append(line)
+        i += 1
+    flush_section()
+    return [{"type": "rich_text", "elements": elements}]
+
+
+def _canonical(blocks: list) -> list:
+    """Blocks reduced to what the converter models, for the lossless check."""
+    def clean(el):
+        if isinstance(el, list):
+            return [clean(e) for e in el]
+        if not isinstance(el, dict):
+            return el
+        out = {}
+        for k, v in el.items():
+            if k in ("block_id", "border") or (k in ("indent", "offset") and not v):
+                continue
+            if k == "style" and isinstance(v, dict):
+                v = {s: True for s, on in v.items() if on and s in ("bold", "italic", "strike", "code")}
+                if not v:
+                    continue
+            if k == "elements":
+                v = [clean(e) for e in v]
+                # Style on whitespace is invisible (Slack leaves bold on lone spaces).
+                v = [{kk: vv for kk, vv in e.items() if kk != "style"}
+                     if e.get("type") == "text" and not e.get("text", "").strip() and not (e.get("style") or {}).get("code")
+                     else e for e in v]
+                v = _merge_texts(v) if el.get("type") in (
+                    "rich_text_section", "rich_text_quote") else v
+                v = [e for e in v if not (e.get("type") == "text" and e.get("text") == "")]
+            out[k] = v if k == "elements" else clean(v)
+        return out
+    return [clean(b) for b in blocks or []]
+
+
+def lossless(blocks: list) -> bool:
+    md, unsupported = blocks_to_md(blocks, {})
+    return not unsupported and _canonical(md_to_blocks(md)) == _canonical(blocks)
+
+
+# --------------------------------------------------------------------------
+# Paths, credentials, config
+# --------------------------------------------------------------------------
+
+def _dir(env: str, xdg: str, default: str) -> pathlib.Path:
+    if os.environ.get(env):
+        return pathlib.Path(os.environ[env])
+    base = os.environ.get(xdg) or str(pathlib.Path.home() / default)
+    return pathlib.Path(base) / "slack-drafts"
+
+
+def state_dir() -> pathlib.Path:
+    return _dir("SLACK_DRAFTS_STATE_DIR", "XDG_STATE_HOME", ".local/state")
+
+
+def config_dir() -> pathlib.Path:
+    return _dir("SLACK_DRAFTS_CONFIG_DIR", "XDG_CONFIG_HOME", ".config")
+
+
+def _private_write(p: pathlib.Path, text: str, append: bool = False) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(p.parent, 0o700)
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC), 0o600)
+    with os.fdopen(fd, "a" if append else "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def load_config() -> dict:
+    p = config_dir() / "config.json"
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _keychain_read(service: str) -> str | None:
+    r = subprocess.run(
+        ["/usr/bin/security", "find-generic-password", "-a", os.environ.get("LOGNAME", ""), "-s", service, "-w"],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def _keychain_write(service: str, value: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9%._+/=-]+", value):
+        raise Fail(EXIT_AUTH, f"refusing to store {service}: unexpected characters")
+    # Through `security -i` on stdin, so the value never appears in argv.
+    cmd = (f'add-generic-password -U -a "{os.environ.get("LOGNAME", "")}" -s "{service}" '
+           f'-T /usr/bin/security -w "{value}"\n')
+    r = subprocess.run(["/usr/bin/security", "-i"], input=cmd, capture_output=True, text=True)
+    if r.returncode != 0 or "error" in (r.stdout + r.stderr).lower():
+        raise Fail(EXIT_AUTH, f"keychain write for {service} failed")
+
+
+def credentials() -> tuple[str, str, str]:
+    cfg = load_config()
+    workspace = os.environ.get("SLACK_DRAFTS_WORKSPACE") or cfg.get("workspace")
+    token = os.environ.get("SLACK_DRAFTS_TOKEN") or _keychain_read(KEYCHAIN_TOKEN)
+    cookie = os.environ.get("SLACK_DRAFTS_COOKIE") or _keychain_read(KEYCHAIN_COOKIE)
+    if not (token and cookie and (workspace or os.environ.get("SLACK_DRAFTS_API"))):
+        raise Fail(EXIT_AUTH, "not logged in: run `slack-drafts auth login`")
+    return token, cookie, workspace or ""
+
+
+# --------------------------------------------------------------------------
+# Slack API
+# --------------------------------------------------------------------------
+
+def api(method: str, args: dict | None = None, creds: tuple | None = None) -> dict:
+    if method not in ALLOWED_METHODS:
+        raise Fail(EXIT_REFUSED, f"{method} is not an allowed method")
+    token, cookie, workspace = creds or credentials()
+    base = os.environ.get("SLACK_DRAFTS_API") or f"https://{workspace}/api/"
+    form = {"token": token}
+    for k, v in (args or {}).items():
+        form[k] = v if isinstance(v, str) else json.dumps(v)
+    data = urllib.parse.urlencode(form).encode()
+    for attempt in range(3):
+        req = urllib.request.Request(base + method, data=data, headers={
+            "Cookie": f"d={cookie}", "User-Agent": "slack-drafts",
+            "Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                time.sleep(min(int(e.headers.get("Retry-After", "2") or 2), 30))
+                continue
+            raise Fail(EXIT_API, f"{method}: HTTP {e.code}") from None
+        except (urllib.error.URLError, TimeoutError) as e:
+            raise Fail(EXIT_API, f"{method}: {getattr(e, 'reason', e)}") from None
+        if body.get("ok"):
+            return body
+        err = body.get("error", "unknown_error")
+        if err in ("invalid_auth", "not_authed", "token_revoked", "token_expired", "account_inactive"):
+            raise Fail(EXIT_AUTH, f"Slack rejected the stored login ({err}): run `slack-drafts auth login`")
+        if err == "draft_has_conflict":
+            raise Fail(EXIT_CONFLICT, "Slack reports the draft changed (draft_has_conflict): run `slack-drafts get` again")
+        detail = "; ".join(body.get("response_metadata", {}).get("messages", []))
+        raise Fail(EXIT_API, f"{method}: {err}" + (f" ({detail})" if detail else ""))
+    raise Fail(EXIT_API, f"{method}: rate limited")
+
+
+def active_drafts() -> list:
+    drafts = api("drafts.list", {"is_active": "true"}).get("drafts", [])
+    live = [d for d in drafts if not d.get("is_sent") and not d.get("is_deleted")]
+    return sorted(live, key=lambda d: decimal.Decimal(d.get("last_updated_ts") or "0"), reverse=True)
+
+
+# --------------------------------------------------------------------------
+# Names (labels only; cached)
+# --------------------------------------------------------------------------
+
+class Names:
+    def __init__(self):
+        self.path = state_dir() / "names.json"
+        try:
+            self.cache = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            self.cache = {}
+        self.dirty = False
+
+    def _get(self, key: str, fetch) -> str | None:
+        hit = self.cache.get(key)
+        if hit and time.time() - hit[1] < 7 * 86400:
+            return hit[0]
+        try:
+            name = fetch()
+        except Fail:
+            return None
+        self.cache[key] = [name, time.time()]
+        self.dirty = True
+        return name
+
+    def user(self, uid: str) -> str | None:
+        def fetch():
+            u = api("users.info", {"user": uid})["user"]
+            return (u.get("profile") or {}).get("real_name") or u.get("real_name") or u.get("name")
+        return self._get(uid, fetch)
+
+    def channel(self, cid: str) -> str | None:
+        def fetch():
+            c = api("conversations.info", {"channel": cid})["channel"]
+            return c.get("name") if not c.get("is_im") else None
+        return self._get(cid, fetch)
+
+    def for_blocks(self, blocks: list) -> dict:
+        found: dict = {}
+
+        def walk(x):
+            if isinstance(x, dict):
+                if x.get("type") == "user" and x.get("user_id"):
+                    found[x["user_id"]] = self.user(x["user_id"])
+                elif x.get("type") == "channel" and x.get("channel_id"):
+                    found[x["channel_id"]] = self.channel(x["channel_id"])
+                for v in x.values():
+                    walk(v)
+            elif isinstance(x, list):
+                for v in x:
+                    walk(v)
+        walk(blocks)
+        return {k: v for k, v in found.items() if v}
+
+    def destination(self, d: dict) -> str:
+        dest = (d.get("destinations") or [{}])[0]
+        cid = dest.get("channel_id", "?")
+        if cid.startswith("D") or dest.get("user_ids"):
+            me = load_config().get("user_id")
+            people = [self.user(u) or u for u in dest.get("user_ids", []) if u != me] or ["yourself"]
+            where = "DM with " + ", ".join(people)
+        else:
+            where = "#" + (self.channel(cid) or cid)
+        if dest.get("thread_ts"):
+            where += f" (thread {dest['thread_ts']})"
+        return where
+
+    def save(self):
+        if self.dirty:
+            _private_write(self.path, json.dumps(self.cache))
+
+
+# --------------------------------------------------------------------------
+# References, revisions, history
+# --------------------------------------------------------------------------
+
+def dest_key(d: dict) -> tuple[str, str]:
+    dest = (d.get("destinations") or [{}])[0]
+    return dest.get("channel_id", ""), dest.get("thread_ts", "") or ""
+
+
+def parse_dest(ref: str) -> tuple[str, str] | None:
+    m = re.match(r"https://[^/]+/archives/([A-Z0-9]+)(?:/p(\d{10})(\d{6}))?(?:\?(.*))?$", ref)
+    if m:
+        channel, thread = m.group(1), ""
+        query = urllib.parse.parse_qs(m.group(4) or "")
+        if query.get("thread_ts"):
+            thread = query["thread_ts"][0]
+        elif m.group(2):
+            thread = f"{m.group(2)}.{m.group(3)}"
+        return channel, thread
+    m = re.fullmatch(r"([CDG][A-Z0-9]{6,})(?::(\d+\.\d+))?", ref)
+    if m:
+        return m.group(1), m.group(2) or ""
+    return None
+
+
+def resolve(ref: str | None, drafts: list) -> dict:
+    if not drafts:
+        raise Fail(EXIT_USAGE, "no unsent drafts")
+    if not ref:
+        return drafts[0]
+    if ref.isdigit():
+        n = int(ref)
+        if 1 <= n <= len(drafts):
+            return drafts[n - 1]
+        raise Fail(EXIT_USAGE, f"no draft #{n}: there are {len(drafts)}")
+    if ref.startswith("Dr"):
+        for d in drafts:
+            if d.get("id") == ref:
+                return d
+        raise Fail(EXIT_USAGE, f"no unsent draft {ref} (draft IDs change when Slack resaves; use the channel or `list`)")
+    dest = parse_dest(ref)
+    if not dest:
+        raise Fail(EXIT_USAGE, f"can't read {ref!r} as a draft ID, list number, channel ID or Slack URL")
+    matches = [d for d in drafts if dest_key(d) == dest]
+    if not matches:
+        raise Fail(EXIT_USAGE, f"no unsent draft in {ref}" + ("" if dest[1] else " (top level; add :THREAD_TS for a thread)"))
+    return matches[0]
+
+
+def write_destinations(d: dict) -> list:
+    """drafts.list returns DM destinations with user_ids; writes accept only the channel (and thread)."""
+    return [{k: v for k, v in dest.items() if k in ("channel_id", "thread_ts") and v}
+            for dest in d.get("destinations", [])]
+
+
+def rev_of(d: dict) -> str:
+    return f"{d['id']}@{d['last_updated_ts']}"
+
+
+def history_path(key: tuple[str, str]) -> pathlib.Path:
+    name = key[0] + (f"_{key[1]}" if key[1] else "")
+    return state_dir() / "drafts" / f"{name}.jsonl"
+
+
+def record(key: tuple[str, str], kind: str, rev: str, md: str) -> None:
+    line = json.dumps({"at": time.time(), "kind": kind, "rev": rev, "md": md}, ensure_ascii=False)
+    _private_write(history_path(key), line + "\n", append=True)
+
+
+def history(key: tuple[str, str]) -> list:
+    try:
+        return [json.loads(x) for x in history_path(key).read_text().splitlines() if x.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def overwrite_note(key: tuple[str, str], current_rev: str, current_md: str) -> str | None:
+    """Warn when the draft looks like a stale Slack composer saved over the agent's last write."""
+    entries = history(key)
+    puts = [i for i, e in enumerate(entries) if e["kind"] in ("put", "new")]
+    if not puts:
+        return None
+    last = entries[puts[-1]]
+    if last["rev"] == current_rev:
+        return None
+    before = next((e for e in reversed(entries[:puts[-1]]) if e["kind"] == "get"), None)
+    if not before:
+        return None
+    sim_put = difflib.SequenceMatcher(None, last["md"], current_md).ratio()
+    sim_before = difflib.SequenceMatcher(None, before["md"], current_md).ratio()
+    if sim_before > sim_put:
+        return ("this draft looks more like the version before the agent's last write than the write itself: "
+                "a message box that wasn't refreshed may have saved over it. "
+                "`slack-drafts diff` shows what the agent wrote")
+    return None
+
+
+def fmt_time(ts: str) -> str:
+    try:
+        return dt.datetime.fromtimestamp(float(ts)).strftime("%b %d %H:%M")
+    except (TypeError, ValueError):
+        return "?"
+
+
+def client_name(d: dict) -> str:
+    c = d.get("last_updated_client") or "?"
+    if "SSB" in c or "Atom" in c:
+        return "Slack desktop"
+    # Slack labels API writes (this tool's included) plain "Slack".
+    return {"Slack": "the API (an agent)", "Chrome": "Slack in a browser"}.get(c, c)
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def read_input(path: str | None) -> str:
+    text = pathlib.Path(path).read_text(encoding="utf-8") if path else sys.stdin.read()
+    if not text.strip():
+        raise Fail(EXIT_USAGE, "no text to write")
+    return text
+
+
+def cmd_list(a) -> int:
+    drafts = active_drafts()
+    names = Names()
+    rows = []
+    for i, d in enumerate(drafts, 1):
+        md, unsupported = blocks_to_md(d.get("blocks", []), {})
+        first = next((ln for ln in md.split("\n") if ln.strip()), "")
+        rows.append({"n": i, "rev": rev_of(d), "to": names.destination(d), "channel": dest_key(d)[0],
+                     "thread_ts": dest_key(d)[1] or None, "updated": fmt_time(d.get("last_updated_ts")),
+                     "client": client_name(d), "scheduled": bool(d.get("date_scheduled")), "first_line": first[:80]})
+    names.save()
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+    elif not rows:
+        print("no unsent drafts", file=sys.stderr)
+    else:
+        for r in rows:
+            sched = " [scheduled]" if r["scheduled"] else ""
+            print(f"{r['n']}. {r['to']} · {r['updated']} · {r['client']}{sched}\n   {r['first_line']}")
+    return 0
+
+
+def cmd_get(a) -> int:
+    drafts = active_drafts()
+    d = resolve(a.ref, drafts)
+    names = Names()
+    blocks = d.get("blocks", [])
+    md, unsupported = blocks_to_md(blocks, names.for_blocks(blocks))
+    where = names.destination(d)
+    names.save()
+    rev = rev_of(d)
+    writable = lossless(blocks) and not d.get("date_scheduled")
+    notes = []
+    if unsupported:
+        notes.append(f"contains {', '.join(sorted(set(unsupported)))}, which this tool can't write back: read-only")
+    elif not lossless(blocks):
+        notes.append("its formatting doesn't convert back exactly: read-only; edit it in Slack")
+    if d.get("date_scheduled"):
+        notes.append("scheduled to send: read-only")
+    if d.get("file_ids"):
+        notes.append(f"has {len(d['file_ids'])} attached file(s), kept as is on write")
+    note = overwrite_note(dest_key(d), rev, md)
+    if note:
+        notes.append(note)
+    record(dest_key(d), "get", rev, md)
+    if a.json:
+        print(json.dumps({"rev": rev, "draft_id": d["id"], "to": where, "channel": dest_key(d)[0],
+                          "thread_ts": dest_key(d)[1] or None, "updated": fmt_time(d.get("last_updated_ts")),
+                          "client": client_name(d), "writable": writable, "notes": notes, "markdown": md},
+                         indent=2, ensure_ascii=False))
+        return 0
+    print(f"slack-drafts: {where} · updated {fmt_time(d.get('last_updated_ts'))} by {client_name(d)}", file=sys.stderr)
+    for n in notes:
+        print(f"slack-drafts: note: {n}", file=sys.stderr)
+    print(f"slack-drafts: rev={rev}", file=sys.stderr)
+    print(md)
+    return 0
+
+
+def _client_ts(current: str) -> str:
+    now = decimal.Decimal(f"{time.time():.6f}")
+    floor = decimal.Decimal(current or "0") + decimal.Decimal("0.000001")
+    return f"{max(now, floor):.6f}"
+
+
+HANDOFF = ("in Slack, switch to another conversation and back before editing this draft: "
+           "an open message box doesn't refresh, and typing into it saves the old text over this one")
+
+
+def cmd_put(a) -> int:
+    m = re.fullmatch(r"(Dr[A-Za-z0-9]+)@(\d+\.\d+)", a.rev or "")
+    if not m:
+        raise Fail(EXIT_USAGE, "--rev must be the rev= value from `slack-drafts get`, e.g. Dr0ABC@1700008619.938185")
+    draft_id, ts = m.groups()
+    text = read_input(a.from_file)
+    blocks = md_to_blocks(text)
+    if "⟦unsupported" in text:
+        raise Fail(EXIT_REFUSED, "the text still holds an ⟦unsupported …⟧ placeholder; that draft is read-only")
+    drafts = active_drafts()
+    d = next((x for x in drafts if x.get("id") == draft_id), None)
+    if not d:
+        raise Fail(EXIT_CONFLICT, f"draft {draft_id} is gone: it was sent, deleted or resaved under a new ID. "
+                                  "Run `slack-drafts get` again and redo the revision on that text")
+    if d.get("last_updated_ts") != ts:
+        raise Fail(EXIT_CONFLICT, f"the draft changed since rev {a.rev} (now {rev_of(d)}, by {client_name(d)}). "
+                                  "Run `slack-drafts get` again and redo the revision on that text")
+    if d.get("date_scheduled"):
+        raise Fail(EXIT_REFUSED, "the draft is scheduled to send; edit it in Slack")
+    if not lossless(d.get("blocks", [])):
+        raise Fail(EXIT_REFUSED, "the draft holds content this tool can't write back without loss; edit it in Slack")
+    resp = api("drafts.update", {
+        "draft_id": draft_id, "client_last_updated_ts": _client_ts(ts), "blocks": blocks,
+        "destinations": write_destinations(d), "file_ids": d.get("file_ids", []),
+        "is_from_composer": "true" if d.get("is_from_composer") else "false"})
+    new = resp.get("draft") or {}
+    new_rev = rev_of(new) if new.get("id") and new.get("last_updated_ts") else "?"
+    written, _ = blocks_to_md(new.get("blocks", blocks), {})
+    record(dest_key(d), "put", new_rev, written)
+    names = Names()
+    print(f"slack-drafts: wrote the draft in {names.destination(d)}; {HANDOFF}", file=sys.stderr)
+    names.save()
+    print(f"rev={new_rev}")
+    return 0
+
+
+def cmd_new(a) -> int:
+    dest = parse_dest(a.dest)
+    if not dest:
+        raise Fail(EXIT_USAGE, f"can't read {a.dest!r} as a channel ID, CHANNEL:THREAD_TS or Slack URL")
+    text = read_input(a.from_file)
+    if "⟦unsupported" in text:
+        raise Fail(EXIT_REFUSED, "the text holds an ⟦unsupported …⟧ placeholder")
+    existing = [d for d in active_drafts() if dest_key(d) == dest]
+    if existing:
+        raise Fail(EXIT_CONFLICT, f"there's already a draft there ({rev_of(existing[0])}): use `get` and `put`")
+    destination = {"channel_id": dest[0], **({"thread_ts": dest[1]} if dest[1] else {})}
+    resp = api("drafts.create", {"blocks": md_to_blocks(text), "destinations": [destination],
+                                 "client_msg_id": str(uuid.uuid4()), "file_ids": [], "is_from_composer": "true"})
+    new = resp.get("draft") or {}
+    new_rev = rev_of(new) if new.get("id") else "?"
+    written, _ = blocks_to_md(new.get("blocks", []), {})
+    record(dest, "new", new_rev, written)
+    print(f"slack-drafts: created the draft; {HANDOFF}", file=sys.stderr)
+    print(f"rev={new_rev}")
+    return 0
+
+
+def cmd_diff(a) -> int:
+    d = resolve(a.ref, active_drafts())
+    key = dest_key(d)
+    puts = [e for e in history(key) if e["kind"] in ("put", "new")]
+    if not puts:
+        raise Fail(EXIT_USAGE, "no agent write recorded for this draft")
+    md, _ = blocks_to_md(d.get("blocks", []), {})
+    last = puts[-1]
+    diff = difflib.unified_diff(last["md"].split("\n"), md.split("\n"), "agent's last write", "draft now", lineterm="")
+    out = "\n".join(diff)
+    print(out if out else "no change since the agent's last write")
+    return 0
+
+
+# --- auth -------------------------------------------------------------------
+
+def _ab(session: str, port: int, *args: str, stdin: str | None = None) -> str:
+    """Run agent-browser and return its stdout. Never echoes it: it may hold secrets."""
+    r = subprocess.run(["agent-browser", "--session", session, "--cdp", str(port), *args],
+                       input=stdin, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise Fail(EXIT_AUTH, f"agent-browser {args[0]} failed (exit {r.returncode})")
+    return r.stdout
+
+
+def _cdp_ready(port: int) -> list | None:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2) as resp:
+            return json.loads(resp.read().decode())
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_auth_login(a) -> int:
+    port = a.port
+    profile = pathlib.Path(a.profile).expanduser()
+    if _cdp_ready(port) is not None:
+        raise Fail(EXIT_USAGE, f"something already listens on port {port}; pick another with --port")
+    subprocess.run(["open", "-na", "Google Chrome", "--args", f"--user-data-dir={profile}",
+                    f"--remote-debugging-port={port}", "--no-first-run", "https://app.slack.com/client"], check=True)
+    session = f"slack-drafts-auth-{os.getpid()}"
+    try:
+        print(f"slack-drafts: log in to Slack in the Chrome window that opened (waiting up to {a.wait}s)", file=sys.stderr)
+        deadline = time.time() + a.wait
+        while True:
+            pages = _cdp_ready(port) or []
+            if any(p.get("type") == "page" and re.search(r"app\.slack\.com/client/[TE]", p.get("url", "")) for p in pages):
+                break
+            if time.time() > deadline:
+                raise Fail(EXIT_AUTH, "timed out waiting for a logged-in Slack page")
+            time.sleep(2)
+        time.sleep(3)  # let the client write its local config
+        js = ("(() => { const c = JSON.parse(localStorage.getItem('localConfig_v2') || '{}');"
+              " const t = (c.teams || {})[location.pathname.split('/')[2]] || {};"
+              " return JSON.stringify({token: t.token || '', url: t.url || '', user_id: t.user_id || '', team_id: t.id || ''}); })()")
+        team = json.loads(json.loads(_ab(session, port, "eval", "--stdin", stdin=js)))
+        cookies = json.loads(_ab(session, port, "cookies", "--json"))
+        if isinstance(cookies, dict):
+            cookies = cookies.get("data", {}).get("cookies") or cookies.get("cookies") or cookies.get("data") or []
+        cookie = next((c.get("value", "") for c in cookies if c.get("name") == "d" and "slack" in c.get("domain", "")), "")
+        if not team.get("token", "").startswith("xoxc-") or not cookie.startswith("xoxd-"):
+            raise Fail(EXIT_AUTH, "couldn't find the Slack session token and cookie in that window")
+        workspace = urllib.parse.urlparse(team["url"]).netloc
+        creds = (team["token"], cookie, workspace)
+        who = api("auth.test", creds=creds)
+        _keychain_write(KEYCHAIN_TOKEN, team["token"])
+        _keychain_write(KEYCHAIN_COOKIE, cookie)
+        _private_write(config_dir() / "config.json", json.dumps(
+            {"workspace": workspace, "team_id": who.get("team_id"), "user_id": who.get("user_id"),
+             "user": who.get("user"), "saved": time.time()}, indent=2))
+        print(f"slack-drafts: stored the login for {who.get('user')} on {workspace}", file=sys.stderr)
+        return 0
+    finally:
+        subprocess.run(["agent-browser", "--session", session, "--cdp", str(port), "close"], capture_output=True)
+        subprocess.run(["pkill", "-f", f"user-data-dir={profile}"], capture_output=True)
+
+
+def cmd_auth_status(a) -> int:
+    who = api("auth.test")
+    print(f"{who.get('user')} ({who.get('user_id')}) on {who.get('url', '').rstrip('/')}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+
+def main(argv: list | None = None) -> int:
+    p = argparse.ArgumentParser(prog="slack-drafts", description=__doc__.split("\n\n", 1)[1],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("list", help="unsent drafts, newest first")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_list)
+    s = sub.add_parser("get", help="a draft as Markdown")
+    s.add_argument("ref", nargs="?")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_get)
+    s = sub.add_parser("put", help="replace a draft's text, if it's still at --rev")
+    s.add_argument("--rev", required=True)
+    s.add_argument("--from", dest="from_file")
+    s.set_defaults(fn=cmd_put)
+    s = sub.add_parser("new", help="start a draft where there is none")
+    s.add_argument("dest")
+    s.add_argument("--from", dest="from_file")
+    s.set_defaults(fn=cmd_new)
+    s = sub.add_parser("diff", help="the agent's last write against the draft now")
+    s.add_argument("ref", nargs="?")
+    s.set_defaults(fn=cmd_diff)
+    s = sub.add_parser("auth", help="log in or check the stored login")
+    asub = s.add_subparsers(dest="auth_cmd", required=True)
+    l = asub.add_parser("login")
+    l.add_argument("--port", type=int, default=9333)
+    l.add_argument("--profile", default="~/.agent-browser-profiles/slack")
+    l.add_argument("--wait", type=int, default=600)
+    l.set_defaults(fn=cmd_auth_login)
+    st = asub.add_parser("status")
+    st.set_defaults(fn=cmd_auth_status)
+    a = p.parse_args(argv)
+    try:
+        return a.fn(a)
+    except Fail as e:
+        print(f"slack-drafts: {e}", file=sys.stderr)
+        return e.code
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
