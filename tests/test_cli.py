@@ -33,6 +33,7 @@ class FakeSlack:
     def __init__(self):
         self.drafts = []
         self.calls = []
+        self.user_saves_before_write = False
         fake = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -69,6 +70,9 @@ class FakeSlack:
             d = next((x for x in self.drafts if x["id"] == form["draft_id"]), None)
             if not d:
                 return {"ok": False, "error": "draft_not_found"}
+            if self.user_saves_before_write:
+                # The user saves in Slack after put's re-read, just before its write lands.
+                d["last_updated_ts"] = f"{float(d['last_updated_ts']) + 1:.6f}"
             if float(form["client_last_updated_ts"]) <= float(d["last_updated_ts"]):
                 return {"ok": False, "error": "draft_has_conflict"}
             d["blocks"] = json.loads(form["blocks"])
@@ -154,6 +158,21 @@ class CLITest(unittest.TestCase):
         r = self.run_cli("put", "--rev", rev, stdin="agent text")
         self.assertEqual(r.returncode, 5, r.stderr)
         self.assertNotIn("drafts.update", self.methods())
+
+    def test_put_loses_the_race_when_the_user_saves_mid_write(self):
+        self.fake.drafts = [draft("Dr1", "1700008619.938185", "v1")]
+        self.fake.user_saves_before_write = True
+        r = self.run_cli("put", "--rev", "Dr1@1700008619.938185", stdin="agent text")
+        self.assertEqual(r.returncode, 5, r.stderr)
+        self.assertEqual(self.fake.drafts[0]["blocks"][0]["elements"][0]["elements"][0]["text"], "v1")
+
+    def test_put_with_no_draft_in_the_response_is_not_success(self):
+        self.fake.drafts = [draft("Dr1", "1700008619.938185", "v1")]
+        orig = self.fake.handle
+        self.fake.handle = lambda m, f: {"ok": True} if m == "drafts.update" else orig(m, f)
+        r = self.run_cli("put", "--rev", "Dr1@1700008619.938185", stdin="agent text")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("slack-drafts get", r.stderr)
 
     def test_put_refuses_when_draft_was_resaved_under_new_id(self):
         self.fake.drafts = [draft("Dr1", "1700008619.938185", "v1")]

@@ -164,6 +164,64 @@ class ToBlocks(unittest.TestCase):
         self.assertEqual(self.blocks("\\*lit\\* \\- x"), rt(sec(t("*lit* - x"))))
 
 
+class ReviewFixes(unittest.TestCase):
+    """Cases from the 2026-11-16 review: each was a wrong write that exited 0."""
+
+    def test_one_line_fence(self):
+        self.assertEqual(norm(sd.md_to_blocks("Run this:\n```make test```\nthen ping me")),
+                         rt(sec(t("Run this:")), {"type": "rich_text_preformatted", "elements": [t("make test")]},
+                            sec(t("then ping me"))))
+
+    def test_fence_language_tag_is_dropped(self):
+        self.assertEqual(norm(sd.md_to_blocks("```python\nx = 1\n```")),
+                         rt({"type": "rich_text_preformatted", "elements": [t("x = 1")]}))
+
+    def test_unclosed_or_ambiguous_fence_is_refused(self):
+        for md in ("```\nnever closed", "```make test\nmore"):
+            with self.subTest(md=md), self.assertRaises(sd.Fail) as cm:
+                sd.md_to_blocks(md)
+            self.assertEqual(cm.exception.code, sd.EXIT_USAGE)
+
+    def test_link_url_with_parentheses(self):
+        self.assertEqual(norm(sd.md_to_blocks("see [Foo](https://w.test/Foo_(bar)) ok")),
+                         rt(sec(t("see "), {"type": "link", "url": "https://w.test/Foo_(bar)", "text": "Foo"}, t(" ok"))))
+
+    def test_unknown_formatting_is_not_lossless(self):
+        bordered = rt({"type": "rich_text_list", "style": "bullet", "indent": 0, "border": 1, "elements": [sec(t("a"))]})
+        underlined = rt(sec(t("x", underline=True)))
+        self.assertFalse(sd.lossless(bordered))
+        self.assertFalse(sd.lossless(underlined))
+
+    def test_invisible_differences_are_lossless(self):
+        emoji_unicode = rt(sec(t("ok "), {"type": "emoji", "name": "white_check_mark", "unicode": "2705"}))
+        bold_trailing_space = rt(sec(t("Note. ", bold=True), t("more text")))
+        self.assertTrue(sd.lossless(emoji_unicode))
+        self.assertTrue(sd.lossless(bold_trailing_space))
+
+    def test_strike_on_a_space_is_visible(self):
+        self.assertFalse(sd.lossless(rt(sec(t("a"), t(" ", strike=True), t("b")))))
+
+    def test_mention_labels_cannot_break_mentions(self):
+        for name in ("Bob >_<", "A* B", "x|y"):
+            for style in ({}, {"bold": True}):
+                blocks = rt(sec({"type": "user", "user_id": "U1", **({"style": style} if style else {})}, t(" hi")))
+                with self.subTest(name=name, style=style):
+                    md, _ = sd.blocks_to_md(blocks, {"U1": name})
+                    self.assertEqual(norm(sd.md_to_blocks(md)), norm(blocks), md)
+
+    def test_backslashes_in_ordinary_text_survive(self):
+        for text in ("C:\\home\\hello", "match \\d+\\.txt", "a \\ b"):
+            with self.subTest(text=text):
+                self.assertEqual(norm(sd.md_to_blocks(text)), rt(sec(t(text))))
+                md, _ = sd.blocks_to_md(rt(sec(t(text))), {})
+                self.assertEqual(norm(sd.md_to_blocks(md)), rt(sec(t(text))), md)
+
+    def test_quote_marker_without_space_is_escaped(self):
+        blocks = rt(sec(t(">b")))
+        md, _ = sd.blocks_to_md(blocks, {})
+        self.assertEqual(norm(sd.md_to_blocks(md)), blocks, md)
+
+
 class RoundTrip(unittest.TestCase):
     """blocks -> md -> blocks keeps structure for what Slack's composer produces."""
 

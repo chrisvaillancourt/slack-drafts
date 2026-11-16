@@ -21,7 +21,7 @@ git clone <this repo> ~/dev/github/chrisvaillancourt/slack-drafts
 slack-drafts auth login                                  # opens Chrome; log in to your workspace once
 ```
 
-`auth login` opens a dedicated Chrome profile (`~/.agent-browser-profiles/slack`), waits for you to log in, copies the web session's token and `d` cookie into the macOS login keychain (`slack-drafts.token`, `slack-drafts.cookie`), then quits that Chrome. The profile keeps the login, so running it again later needs no password. Run it again when commands exit 3.
+`auth login` opens Chrome on a throwaway profile, waits for you to log in, copies the web session's token and `d` cookie into the macOS login keychain (`slack-drafts.token`, `slack-drafts.cookie`), then quits that Chrome and deletes the profile, so the login lives only in the keychain. Run it again when commands exit 3. The stored login lasts until you sign that web session out.
 
 ## Use
 
@@ -41,7 +41,7 @@ slack-drafts new C0123ABCD < first.md   # start a draft where there is none
 ## How it's safe
 
 - **No send path.** The CLI calls only `auth.test`, `drafts.list`, `drafts.create`, `drafts.update`, `conversations.info` and `users.info`, enforced in code and by a test. It has no delete, and it refuses to touch scheduled drafts.
-- **No lost edits.** `put` needs the `rev` from `get` and refuses (exit 5) if the draft changed since, so an agent can't write over an edit it didn't see. Drafts with formatting the converter can't reproduce exactly are read-only.
+- **No lost edits.** `put` needs the `rev` from `get` and refuses (exit 5) if the draft changed since, and Slack itself rejects the write if you save in the moment between, so an agent can't write over an edit it didn't see. Drafts with formatting the converter can't reproduce exactly are read-only.
 - **Secrets stay out of output.** The token and cookie go from the browser to the keychain inside the CLI's own subprocesses and are never printed. History of reads and writes (your message text) is kept in `~/.local/state/slack-drafts` with private permissions.
 
 It uses Slack's internal drafts API, the one the web client uses, which Slack doesn't document and could change. [docs/design.md](docs/design.md) has the options weighed, the verified API behavior and the limits.

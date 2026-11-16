@@ -50,8 +50,10 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -81,7 +83,9 @@ class Fail(Exception):
 
 STYLE_MARKS = (("code", "`"), ("strike", "~"), ("italic", "_"), ("bold", "*"))  # inner to outer
 MARK_STYLE = {"*": "bold", "_": "italic", "~": "strike"}
-LINE_START = re.compile(r"^( *)([-*•>]|```|\d+[.)])(?= |$|`)")
+LINE_START = re.compile(r"^( *)(>|```|[-*•](?= |$)|\d+[.)](?= |$))")
+FENCE_OPEN = re.compile(r"```[A-Za-z0-9_+.#-]*")  # a language tag is allowed and dropped
+FENCE_INLINE = re.compile(r"```(.*?[^`].*?)```")
 LIST_ITEM = re.compile(r"^( *)([-*•]|(\d+)[.)]) (.*)$")
 QUOTE = re.compile(r"^> ?(.*)$")
 EMOJI = re.compile(r":([a-z0-9_+'-]+):(?::skin-tone-([2-6]):)?")
@@ -90,7 +94,8 @@ CHANNEL = re.compile(r"<#([CGD][A-Z0-9]+)(?:\|[^>\n]*)?>")
 BROADCAST = re.compile(r"<!(here|channel|everyone)>")
 USERGROUP = re.compile(r"<!subteam\^([A-Z0-9]+)(?:\|[^>\n]*)?>")
 ANGLE_LINK = re.compile(r"<((?:https?|mailto):[^|>\s]+)(?:\|([^>\n]*))?>")
-MD_LINK = re.compile(r"\[([^\]\n]+)\]\(((?:https?|mailto):[^)\s]+)\)")
+MD_LINK = re.compile(r"\[([^\]\n]+)\]\(((?:https?|mailto):(?:[^()\s]|\([^()\s]*\))+)\)")  # balanced () in URLs
+UNESCAPE = set("\\`*_~[<:-•>")  # what _escape_text and _escape_line_starts add, plus "h", "." and ")" in context
 BARE_URL = re.compile(r"https?://[^\s<>]+")
 PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~•")
 
@@ -188,10 +193,12 @@ def _inline_md(elements: list, names: dict, unsupported: list) -> str:
             raw = f"[{label}]({url})" if label and label != url else url
         elif kind == "user":
             uid = el.get("user_id", "")
-            raw = f"<@{uid}|{names[uid]}>" if names.get(uid) else f"<@{uid}>"
+            label = _label(names.get(uid))
+            raw = f"<@{uid}|{label}>" if label else f"<@{uid}>"
         elif kind == "channel":
             cid = el.get("channel_id", "")
-            raw = f"<#{cid}|{names[cid]}>" if names.get(cid) else f"<#{cid}>"
+            label = _label(names.get(cid))
+            raw = f"<#{cid}|{label}>" if label else f"<#{cid}>"
         elif kind == "usergroup":
             raw = f"<!subteam^{el.get('usergroup_id', '')}>"
         elif kind == "broadcast":
@@ -205,6 +212,11 @@ def _inline_md(elements: list, names: dict, unsupported: list) -> str:
             raw = f"⟦unsupported {kind}⟧"
         parts.append(_wrap(raw, style))
     return "".join(parts)
+
+
+def _label(name: str | None) -> str:
+    """A mention label with nothing that could end the mention or start markup."""
+    return re.sub(r"[<>|*_~`\\\n]", "", name or "").strip()
 
 
 def _escape_line_starts(text: str) -> str:
@@ -296,10 +308,14 @@ def _parse_inline(s: str, style: dict | None = None) -> list:
     while i < n:
         ch = s[i]
         prev = s[i - 1] if i > 0 else None
-        if ch == "\\" and i + 1 < n and s[i + 1] in PUNCT | {"h"}:
-            buf.append(s[i + 1])
-            i += 2
-            continue
+        if ch == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            line_so_far = s[s.rfind("\n", 0, i) + 1:i]
+            if (nxt in UNESCAPE or (nxt == "h" and s.startswith("http", i + 1))
+                    or (nxt in ".)" and re.fullmatch(r" *\d+", line_so_far))):
+                buf.append(nxt)
+                i += 2
+                continue
         if ch == "`":
             j = s.find("`", i + 1)
             if j > i + 1:
@@ -379,14 +395,25 @@ def md_to_blocks(md: str) -> list:
     i = 0
     while i < len(lines):
         line = lines[i]
-        if line.strip().startswith("```"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
             flush_section()
-            body = []
-            i += 1
-            while i < len(lines) and lines[i].strip() != "```":
-                body.append(lines[i])
+            one = FENCE_INLINE.fullmatch(stripped)
+            if one:
+                body = [one.group(1)]
                 i += 1
-            i += 1
+            elif FENCE_OPEN.fullmatch(stripped):
+                body = []
+                i += 1
+                while i < len(lines) and lines[i].strip() != "```":
+                    body.append(lines[i])
+                    i += 1
+                if i >= len(lines):
+                    raise Fail(EXIT_USAGE, f"line {i - len(body)}: a ``` fence is never closed")
+                i += 1
+            else:
+                raise Fail(EXIT_USAGE, f"line {i + 1}: text after an opening ```: put the code on the next line, "
+                                       "or close the fence on the same line")
             elements.append({"type": "rich_text_preformatted", "elements": [{"type": "text", "text": "\n".join(body)}]})
             continue
         m = LIST_ITEM.match(line)
@@ -420,8 +447,26 @@ def md_to_blocks(md: str) -> list:
     return [{"type": "rich_text", "elements": elements}]
 
 
+INVISIBLE_ON_SPACE = {"bold", "italic"}  # strike and code show on whitespace
+
+
+def _hug(e: dict) -> list:
+    """Move whitespace out of bold/italic runs, where it doesn't show."""
+    style = e.get("style") or {}
+    text = e.get("text", "")
+    if e.get("type") != "text" or not style or not set(style) <= INVISIBLE_ON_SPACE:
+        return [e]
+    core = text.strip()
+    plain = {kk: vv for kk, vv in e.items() if kk != "style"}
+    if not core:
+        return [plain]
+    lead, trail = text[: len(text) - len(text.lstrip())], text[len(text.rstrip()):]
+    return ([{**plain, "text": lead}] if lead else []) + [{**e, "text": core}] + ([{**plain, "text": trail}] if trail else [])
+
+
 def _canonical(blocks: list) -> list:
-    """Blocks reduced to what the converter models, for the lossless check."""
+    """Blocks reduced to what shows, for the lossless check. Unknown keys and styles are kept,
+    so anything the converter doesn't model makes the comparison fail."""
     def clean(el):
         if isinstance(el, list):
             return [clean(e) for e in el]
@@ -429,29 +474,32 @@ def _canonical(blocks: list) -> list:
             return el
         out = {}
         for k, v in el.items():
-            if k in ("block_id", "border") or (k in ("indent", "offset") and not v):
+            if k == "block_id" or (k in ("indent", "offset", "border") and not v):
                 continue
+            if k == "unicode" and el.get("type") == "emoji":
+                continue  # Slack derives it from the name
             if k == "style" and isinstance(v, dict):
-                v = {s: True for s, on in v.items() if on and s in ("bold", "italic", "strike", "code")}
+                v = {s: True for s, on in v.items() if on}
                 if not v:
                     continue
             if k == "elements":
-                v = [clean(e) for e in v]
-                # Style on whitespace is invisible (Slack leaves bold on lone spaces).
-                v = [{kk: vv for kk, vv in e.items() if kk != "style"}
-                     if e.get("type") == "text" and not e.get("text", "").strip() and not (e.get("style") or {}).get("code")
-                     else e for e in v]
-                v = _merge_texts(v) if el.get("type") in (
-                    "rich_text_section", "rich_text_quote") else v
+                v = [h for e in v for h in _hug(clean(e))]
+                v = _merge_texts(v) if el.get("type") in ("rich_text_section", "rich_text_quote") else v
                 v = [e for e in v if not (e.get("type") == "text" and e.get("text") == "")]
             out[k] = v if k == "elements" else clean(v)
         return out
     return [clean(b) for b in blocks or []]
 
 
-def lossless(blocks: list) -> bool:
-    md, unsupported = blocks_to_md(blocks, {})
-    return not unsupported and _canonical(md_to_blocks(md)) == _canonical(blocks)
+def lossless(blocks: list, names: dict | None = None) -> bool:
+    """True when the Markdown `get` prints parses back to what the draft shows now."""
+    md, unsupported = blocks_to_md(blocks, names or {})
+    if unsupported:
+        return False
+    try:
+        return _canonical(md_to_blocks(md)) == _canonical(blocks)
+    except Fail:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -785,15 +833,17 @@ def cmd_get(a) -> int:
     d = resolve(a.ref, drafts)
     names = Names()
     blocks = d.get("blocks", [])
-    md, unsupported = blocks_to_md(blocks, names.for_blocks(blocks))
+    label_map = names.for_blocks(blocks)
+    md, unsupported = blocks_to_md(blocks, label_map)
     where = names.destination(d)
     names.save()
     rev = rev_of(d)
-    writable = lossless(blocks) and not d.get("date_scheduled")
+    exact = lossless(blocks, label_map)
+    writable = exact and not d.get("date_scheduled")
     notes = []
     if unsupported:
         notes.append(f"contains {', '.join(sorted(set(unsupported)))}, which this tool can't write back: read-only")
-    elif not lossless(blocks):
+    elif not exact:
         notes.append("its formatting doesn't convert back exactly: read-only; edit it in Slack")
     if d.get("date_scheduled"):
         notes.append("scheduled to send: read-only")
@@ -817,10 +867,11 @@ def cmd_get(a) -> int:
     return 0
 
 
-def _client_ts(current: str) -> str:
-    now = decimal.Decimal(f"{time.time():.6f}")
-    floor = decimal.Decimal(current or "0") + decimal.Decimal("0.000001")
-    return f"{max(now, floor):.6f}"
+def _client_ts(read_ts: str) -> str:
+    """The revision we read plus 1 µs. Slack rejects a write whose client_last_updated_ts isn't newer
+    than the stored one, so any save after our read makes this write fail: a compare-and-swap.
+    (Verified 2026-11-16: Slack accepts the past value and stores its own time.)"""
+    return f"{decimal.Decimal(read_ts) + decimal.Decimal('0.000001'):.6f}"
 
 
 HANDOFF = ("in Slack, switch to another conversation and back before editing this draft: "
@@ -846,17 +897,21 @@ def cmd_put(a) -> int:
                                   "Run `slack-drafts get` again and redo the revision on that text")
     if d.get("date_scheduled"):
         raise Fail(EXIT_REFUSED, "the draft is scheduled to send; edit it in Slack")
-    if not lossless(d.get("blocks", [])):
+    if not lossless(d.get("blocks", []), Names().for_blocks(d.get("blocks", []))):
         raise Fail(EXIT_REFUSED, "the draft holds content this tool can't write back without loss; edit it in Slack")
     resp = api("drafts.update", {
         "draft_id": draft_id, "client_last_updated_ts": _client_ts(ts), "blocks": blocks,
         "destinations": write_destinations(d), "file_ids": d.get("file_ids", []),
         "is_from_composer": "true" if d.get("is_from_composer") else "false"})
     new = resp.get("draft") or {}
-    new_rev = rev_of(new) if new.get("id") and new.get("last_updated_ts") else "?"
-    written, _ = blocks_to_md(new.get("blocks", blocks), {})
-    record(dest_key(d), "put", new_rev, written)
+    if not (new.get("id") and new.get("last_updated_ts")):
+        raise Fail(EXIT_API, "Slack accepted the write but returned no draft, so whether it landed is unknown: "
+                             "run `slack-drafts get` to see what the draft holds")
+    new_rev = rev_of(new)
     names = Names()
+    new_blocks = new.get("blocks", blocks)
+    written, _ = blocks_to_md(new_blocks, names.for_blocks(new_blocks))
+    record(dest_key(d), "put", new_rev, written)
     print(f"slack-drafts: wrote the draft in {names.destination(d)}; {HANDOFF}", file=sys.stderr)
     names.save()
     print(f"rev={new_rev}")
@@ -877,8 +932,11 @@ def cmd_new(a) -> int:
     resp = api("drafts.create", {"blocks": md_to_blocks(text), "destinations": [destination],
                                  "client_msg_id": str(uuid.uuid4()), "file_ids": [], "is_from_composer": "true"})
     new = resp.get("draft") or {}
-    new_rev = rev_of(new) if new.get("id") else "?"
-    written, _ = blocks_to_md(new.get("blocks", []), {})
+    if not (new.get("id") and new.get("last_updated_ts")):
+        raise Fail(EXIT_API, "Slack accepted the draft but returned none, so whether it exists is unknown: "
+                             "run `slack-drafts list` before trying again")
+    new_rev = rev_of(new)
+    written, _ = blocks_to_md(new.get("blocks", []), Names().for_blocks(new.get("blocks", [])))
     record(dest, "new", new_rev, written)
     print(f"slack-drafts: created the draft; {HANDOFF}", file=sys.stderr)
     print(f"rev={new_rev}")
@@ -903,8 +961,10 @@ def cmd_diff(a) -> int:
 
 def _ab(session: str, port: int, *args: str, stdin: str | None = None) -> str:
     """Run agent-browser and return its stdout. Never echoes it: it may hold secrets."""
+    # Drop agent-browser settings that would save cookies or storage to disk.
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENT_BROWSER_RESTORE", "AGENT_BROWSER_STATE"))}
     r = subprocess.run(["agent-browser", "--session", session, "--cdp", str(port), *args],
-                       input=stdin, capture_output=True, text=True, timeout=60)
+                       input=stdin, capture_output=True, text=True, timeout=60, env=env)
     if r.returncode != 0:
         raise Fail(EXIT_AUTH, f"agent-browser {args[0]} failed (exit {r.returncode})")
     return r.stdout
@@ -920,7 +980,8 @@ def _cdp_ready(port: int) -> list | None:
 
 def cmd_auth_login(a) -> int:
     port = a.port
-    profile = pathlib.Path(a.profile).expanduser()
+    # A throwaway profile, deleted afterwards, so the login lives only in the keychain.
+    profile = pathlib.Path(tempfile.mkdtemp(prefix="slack-drafts-login-"))
     if _cdp_ready(port) is not None:
         raise Fail(EXIT_USAGE, f"something already listens on port {port}; pick another with --port")
     subprocess.run(["open", "-na", "Google Chrome", "--args", f"--user-data-dir={profile}",
@@ -960,6 +1021,11 @@ def cmd_auth_login(a) -> int:
     finally:
         subprocess.run(["agent-browser", "--session", session, "--cdp", str(port), "close"], capture_output=True)
         subprocess.run(["pkill", "-f", f"user-data-dir={profile}"], capture_output=True)
+        for _ in range(20):  # Chrome writes to the profile until it exits
+            if subprocess.run(["pgrep", "-f", f"user-data-dir={profile}"], capture_output=True).returncode != 0:
+                break
+            time.sleep(0.5)
+        shutil.rmtree(profile, ignore_errors=True)
 
 
 def cmd_auth_status(a) -> int:
@@ -996,7 +1062,6 @@ def main(argv: list | None = None) -> int:
     asub = s.add_subparsers(dest="auth_cmd", required=True)
     l = asub.add_parser("login")
     l.add_argument("--port", type=int, default=9333)
-    l.add_argument("--profile", default="~/.agent-browser-profiles/slack")
     l.add_argument("--wait", type=int, default=600)
     l.set_defaults(fn=cmd_auth_login)
     st = asub.add_parser("status")
